@@ -32,6 +32,10 @@ model CarbonProject {
   deletedAt           DateTime?
   deletionReason      String?
   retentionUntil      DateTime?
+  /// Start of the current version in the temporal table
+  started_at          DateTime @default(now())
+  /// End of the current version in the temporal table (null if current)
+  ended_at            DateTime?
   createdAt           DateTime @default(now())
   updatedAt           DateTime @updatedAt
   ipfsFiles           IPFSFile[]
@@ -55,6 +59,7 @@ model CarbonProject {
   @@index([lastMonitoringAt])
   @@index([deletedAt])
   @@index([retentionUntil])
+  @@index([started_at, ended_at])
 }
 
 model CreditBatch {
@@ -69,6 +74,10 @@ model CreditBatch {
   metadataCid String
   issuedAt    DateTime @default(now()) @db.Timestamptz
   deletedAt   DateTime?
+  /// Start of the current version in the temporal table
+  started_at  DateTime @default(now())
+  /// End of the current version in the temporal table (null if current)
+  ended_at    DateTime?
 
   project     CarbonProject      @relation(fields: [projectId], references: [projectId])
   retirements RetirementRecord[]
@@ -79,6 +88,11 @@ model CreditBatch {
   @@index([deletedAt])
   // Performance optimization index for batch lookups
   @@index([projectId, status])  // Optimize batch queries by project and status
+  // Serial range search indexes (#1019)
+  @@index([serialStart])
+  @@index([serialEnd])
+  @@index([serialStart, serialEnd])
+  @@index([batchId])
 }
 
 model RetirementRecord {
@@ -114,6 +128,10 @@ model RetirementRecord {
   validatedAt              DateTime?
   retiredAt                DateTime  @default(now())
   deletedAt                DateTime?
+  /// Start of the current version in the temporal table
+  started_at               DateTime @default(now())
+  /// End of the current version in the temporal table (null if current)
+  ended_at                 DateTime?
 
   batch   CreditBatch   @relation(fields: [batchId], references: [batchId])
   project CarbonProject @relation(fields: [projectId], references: [projectId])
@@ -129,6 +147,7 @@ model RetirementRecord {
   @@index([legacyStatus])
   // Supports GET /certificates/:cid/verify lookups (#600)
   @@index([certificateContentCid])
+  @@index([started_at, ended_at])
 }
 
 model ZkRetirementProof {
@@ -188,6 +207,15 @@ model MarketListing {
   methodology     String
   country         String
   status          String   @default("Active")
+  /// Whether this listing is currently paused and unavailable for purchase.
+  /// Defaults to false so existing rows remain active without a data migration.
+  is_paused       Boolean  @default(false)
+  /// Timestamp when this listing was paused; null when not paused.
+  paused_at       DateTime?
+  /// Stellar public key of the admin who triggered the pause.
+  paused_by       String?
+  /// Human-readable reason for the pause (e.g. "Security investigation").
+  pause_reason    String?
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
   deletedAt       DateTime?
@@ -201,8 +229,8 @@ model MarketListing {
   @@index([deletedAt])
   // Supports ORDER BY status, createdAt DESC on the listings browse page
   @@index([status, createdAt])
-  // Performance optimization indexes
-  @@index([status, createdAt])  // Optimize listing browsing with pagination
+  // Issue #1231: fast lookup of all currently-paused listings
+  @@index([is_paused, paused_at])
 }
 
 model MonitoringData {
@@ -307,6 +335,9 @@ model AuditLog {
   ipAddress    String?
   result       String?  // e.g., "Success", "Failure: <error>"
   metadata     Json?    // Optional extra info
+  before       Json?    // State before the operation
+  after        Json?    // State after the operation
+  txHash       String?  // Related blockchain transaction hash
   timestamp    DateTime @default(now())
   /// SHA-256 hex digest of the preceding AuditLog entry's entryHash (null for first entry)
   previousHash String?
@@ -318,6 +349,8 @@ model AuditLog {
   @@index([resourceId])
   @@index([timestamp])
   @@index([entryHash])
+  @@index([resourceId, timestamp])
+  @@index([userId, timestamp])
 }
 
 model SyncMetadata {
@@ -429,6 +462,38 @@ model AdminConfig {
   updatedAt DateTime @updatedAt
 }
 
+/// Dead Letter Queue — persists jobs that have exhausted all BullMQ retry
+/// attempts, preserving the full error context for manual inspection and
+/// admin-triggered requeueing.
+model DeadLetterJob {
+  id            String   @id @default(cuid())
+  /// Original BullMQ job ID
+  jobId         String   @unique
+  /// Queue name (e.g. "carbonledger")
+  queueName     String
+  /// Job type / name (e.g. "oracle_submission")
+  jobType       String
+  /// Original job payload (JSON)
+  payload       Json
+  /// Number of attempts made before the job was dead-lettered
+  attempts      Int
+  /// Full error message from the last failed attempt
+  lastError     String   @db.Text
+  /// Full stack trace from the last failed attempt
+  errorStack    String?  @db.Text
+  /// When the job was first enqueued
+  enqueuedAt    DateTime
+  /// When the job was moved to the DLQ
+  failedAt      DateTime @default(now())
+  /// Whether this job has been manually requeued
+  requeued      Boolean  @default(false)
+  requeuedAt    DateTime?
+
+  @@index([queueName, jobType])
+  @@index([failedAt])
+  @@index([requeued])
+}
+
 /// Stores idempotency records for critical mutating endpoints.
 /// A record is keyed by (idempotencyKey, endpoint) to allow the same key
 /// to be reused across different endpoints without collision.
@@ -498,6 +563,8 @@ model WebhookSubscription {
   secret       String
   events       String[] // e.g. ["retirement.confirmed", "certificate.ready", "credit.purchased"]
   active       Boolean  @default(true)
+  degraded     Boolean  @default(false)
+  consecutiveFailures Int @default(0)
   createdAt    DateTime @default(now())
 
   deliveryLogs WebhookDeliveryLog[]
@@ -545,6 +612,94 @@ model CreditEvent {
   @@index([timestamp])
   // Covering index for the provenance query: WHERE creditBatchId = $1 ORDER BY timestamp ASC
   @@index([creditBatchId, timestamp])
+}
+
+/// History table for CarbonProject — maintains complete audit trail of all project state changes.
+/// Each row represents a version of a project; ended_at is null for the current version.
+model CarbonProjectHistory {
+  id                  String   @id @default(cuid())
+  projectId           String   @db.VarChar(255)
+  name                String
+  description         String?  @db.Text
+  methodology         String
+  country             String
+  projectType         String
+  status              String
+  vintageYear         Int
+  methodologyScore    Int
+  totalCreditsIssued  Decimal  @db.Decimal(18, 2)
+  totalCreditsRetired Decimal  @db.Decimal(18, 2)
+  verifierAddress     String
+  ownerAddress        String
+  coordinates         Json?
+  migrationVersion    String?
+  lastMonitoringAt    DateTime?
+  /// Start of this version's validity period
+  started_at          DateTime
+  /// End of this version's validity period (null = current)
+  ended_at            DateTime?
+  createdAt           DateTime
+  updatedAt           DateTime
+  deletedAt           DateTime?
+  deletionReason      String?
+  retentionUntil      DateTime?
+
+  @@index([projectId, started_at])
+  @@index([started_at, ended_at])
+  @@index([ended_at])
+}
+
+/// History table for CreditBatch — maintains complete audit trail of all batch state changes.
+/// Each row represents a version of a batch; ended_at is null for the current version.
+model CreditBatchHistory {
+  id          String   @id @default(cuid())
+  batchId     String   @db.VarChar(255)
+  projectId   String   @db.VarChar(255)
+  vintageYear Int
+  amount      Decimal  @db.Decimal(18, 2)
+  serialStart String
+  serialEnd   String
+  status      String
+  metadataCid String
+  /// Start of this version's validity period
+  started_at  DateTime
+  /// End of this version's validity period (null = current)
+  ended_at    DateTime?
+  issuedAt    DateTime @db.Timestamptz
+  deletedAt   DateTime?
+
+  @@index([batchId, started_at])
+  @@index([projectId, started_at])
+  @@index([ended_at])
+}
+
+/// History table for RetirementRecord — maintains complete audit trail of all retirement state changes.
+/// Each row represents a version of a retirement; ended_at is null for the current version.
+model RetirementRecordHistory {
+  id                  String   @id @default(cuid())
+  retirementId        String   @db.VarChar(255)
+  batchId             String   @db.VarChar(255)
+  projectId           String   @db.VarChar(255)
+  amount              Decimal  @db.Decimal(18, 2)
+  retiredBy           String
+  beneficiary         String
+  retirementReason    String
+  vintageYear         Int
+  serialStart         String
+  serialEnd           String
+  status              String
+  txHash              String
+  /// Start of this version's validity period
+  started_at          DateTime
+  /// End of this version's validity period (null = current)
+  ended_at            DateTime?
+  createdAt           DateTime
+  updatedAt           DateTime
+  deletedAt           DateTime?
+
+  @@index([retirementId, started_at])
+  @@index([projectId, started_at])
+  @@index([ended_at])
 }
 
 model SatelliteWebhookProvider {
@@ -631,6 +786,40 @@ model TwoFactorAuth {
   @@index([userId])
 }
 
+/// Dedicated sensitive-operations audit table (#1022).
+/// Tracks every high-sensitivity action (delete, role change, admin operation, etc.)
+/// independently of the general-purpose AuditLog so compliance queries are fast
+/// and the two concerns remain cleanly separated.
+///
+/// Column notes:
+///   actor_id      — Stellar public key (G…) of the user who performed the action.
+///   action        — Verb describing the operation, e.g. "user.role_change",
+///                   "project.delete", "credit.mint".
+///   resource_type — Entity kind, e.g. "User", "CarbonProject", "CreditBatch".
+///   resource_id   — Primary-key value of the affected entity.
+///   details       — Arbitrary JSON payload: before/after state, reason, metadata.
+///   timestamp     — Set by the database at insert time; never editable.
+model AuditLogEntry {
+  id           String   @id @default(cuid())
+  /// Stellar public key of the acting user; null for system-generated events.
+  actor_id     String?
+  action       String
+  resource_type String
+  resource_id  String
+  /// JSON payload carrying context (before/after state, reason, IP, etc.)
+  details      Json     @default("{}")
+  timestamp    DateTime @default(now()) @db.Timestamptz(6)
+
+  @@map("audit_logs")
+
+  @@index([actor_id])
+  @@index([action])
+  @@index([resource_type, resource_id])
+  @@index([timestamp])
+  @@index([actor_id, timestamp])
+  @@index([resource_type, resource_id, timestamp])
+}
+
 /// One-time recovery codes for 2FA account lockout (#1079).
 /// Each user gets 10 codes on 2FA setup; each code is single-use.
 model RecoveryCode {
@@ -642,4 +831,103 @@ model RecoveryCode {
 
   @@index([userId])
   @@index([userId, usedAt])
+}
+
+/// Emergency pause / unpause of the credit or marketplace contract (#1324).
+///
+/// Rows are written from two directions and joined on (txHash, action):
+///   - the event indexer records the on-chain `(c_ledger, paused|unpaused)`
+///     event (admin, pausedUntil, occurredAt, eventId)
+///   - an admin records *why* the contract was paused via
+///     POST /admin/pause-analytics/events (reason)
+/// Whichever arrives first creates the row; the other fills in its fields.
+model PauseEvent {
+  id          String    @id @default(cuid())
+  /// "credit" | "marketplace"
+  contract    String
+  /// "pause" | "unpause"
+  action      String
+  /// Stellar public key of the admin that signed the transaction
+  admin       String
+  reason      String?
+  /// Requested auto-expiry for a pause; null for unpause
+  pausedUntil DateTime?
+  txHash      String
+  /// Soroban RPC event id; null until the indexer has seen the event
+  eventId     String?   @unique
+  /// Ledger close time of the event (or API receipt time until indexed)
+  occurredAt  DateTime
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@unique([txHash, action])
+  @@index([contract, occurredAt])
+  @@index([occurredAt])
+  @@map("pause_events")
+}
+
+/// Tracks the cached pause status for each Soroban contract polled by
+/// ContractStateSyncService (#1230). One row per contract.
+/// Updated on every sync cycle; triggers a change event when isPaused flips.
+model ContractSyncState {
+  id               String    @id @default(cuid())
+  /// On-chain contract ID (Soroban address)
+  contractId       String    @unique
+  /// Human-readable contract name, e.g. "carbon_credit"
+  contractName     String
+  /// Cached pause status — reflects the last successful poll
+  isPaused         Boolean   @default(false)
+  /// Human-readable pause reason returned by the contract
+  pauseReason      String?
+  /// Auto-expiry timestamp for the current pause window; null if unpaused
+  pausedUntil      DateTime?
+  /// When this row was last successfully synced from the chain
+  lastSyncedAt     DateTime  @default(now())
+  /// Last error message (null if last sync was successful)
+  lastError        String?
+  /// When the last error occurred
+  lastErrorAt      DateTime?
+  /// 'idle' | 'syncing' | 'completed' | 'failed'
+  syncStatus       String    @default("idle")
+  /// Number of consecutive sync errors; reset to 0 on success
+  consecutiveErrors Int      @default(0)
+  updatedAt        DateTime  @updatedAt
+
+  @@index([contractName])
+  @@index([isPaused])
+  @@index([lastSyncedAt])
+  @@map("contract_sync_state")
+}
+
+/// Audit trail of every alert sent (email / Slack / webhook) when a
+/// contract pause status changes (#1229). Used to enforce per-contract
+/// cooldown windows and provide an ops notification history.
+model PauseAlertLog {
+  id            String    @id @default(cuid())
+  /// On-chain contract ID
+  contractId    String
+  /// Human-readable contract name
+  contractName  String
+  /// 'pause' | 'unpause'
+  action        String
+  /// 'email' | 'slack' | 'webhook'
+  channel       String
+  /// Recipient address / URL / identifier (may be redacted in logs)
+  recipient     String?
+  /// Pause reason passed to the alert
+  reason        String?
+  /// Auto-expiry for the pause window (if applicable)
+  pausedUntil   DateTime?
+  /// 'sent' | 'failed' | 'skipped_cooldown'
+  status        String    @default("sent")
+  /// Error detail when status = 'failed'
+  error         String?
+  sentAt        DateTime  @default(now())
+  createdAt     DateTime  @default(now())
+
+  @@index([contractId, sentAt(sort: Desc)])
+  @@index([channel, sentAt(sort: Desc)])
+  @@index([action])
+  @@index([sentAt(sort: Desc)])
+  @@map("pause_alert_log")
 }

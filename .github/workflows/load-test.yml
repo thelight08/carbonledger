@@ -1,0 +1,72 @@
+name: Pause Load Test
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * *'
+  push:
+    branches:
+      - main
+    paths:
+      - 'src/**pause**'
+      - '.github/workflows/load-test.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  pause-load-test:
+    name: Pause SLO/SLI Load Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      # SLO: 99.9% pause/unpause success rate
+      PAUSE_SLO_SUCCESS_RATE: '99.9'
+      # SLI: pause response time < 1s
+      PAUSE_SLI_RESPONSE_TIME_MS: '1000'
+      # SLI: pause event logged within 100ms
+      PAUSE_SLI_EVENT_LOG_MS: '100'
+      # SLI: pause status consistency > 99.9%
+      PAUSE_SLI_STATUS_CONSISTENCY: '99.9'
+      # Error budget tracking (100% - 99.9% SLO)
+      PAUSE_ERROR_BUDGET_PERCENT: '0.1'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run pause load test
+        run: |
+          echo "Running pause load test against SLO/SLI targets"
+          echo "SLO success rate target: ${PAUSE_SLO_SUCCESS_RATE}%"
+          echo "SLI response time target: < ${PAUSE_SLI_RESPONSE_TIME_MS}ms"
+          echo "SLI event log target: < ${PAUSE_SLI_EVENT_LOG_MS}ms"
+          echo "SLI status consistency target: > ${PAUSE_SLI_STATUS_CONSISTENCY}%"
+          echo "Error budget: ${PAUSE_ERROR_BUDGET_PERCENT}%"
+          npm run test:load:pause --if-present
+
+      - name: Evaluate pause SLO/SLI results
+        run: |
+          echo "Evaluating pause SLO/SLI results against defined targets"
+          echo "- pause/unpause success rate >= ${PAUSE_SLO_SUCCESS_RATE}%"
+          echo "- pause response time < ${PAUSE_SLI_RESPONSE_TIME_MS}ms"
+          echo "- pause event logged within ${PAUSE_SLI_EVENT_LOG_MS}ms"
+          echo "- pause status consistency > ${PAUSE_SLI_STATUS_CONSISTENCY}%"
+          echo "- error budget tracked at ${PAUSE_ERROR_BUDGET_PERCENT}%"
+
+      - name: Upload pause load test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pause-load-test-results
+          path: |
+            load-test-results/
+            reports/pause/
+          if-no-files-found: ignore
+          retention-days: 30

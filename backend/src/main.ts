@@ -14,6 +14,7 @@ import { ValidationExceptionFilter } from './common/validation-exception.filter'
 import { AllExceptionsFilter } from './common/all-exceptions.filter';
 import { LoggerService } from './logger/logger.service';
 import { DdosProtectionMiddleware } from './security/ddos-protection.middleware';
+import { RequestLoggingMiddleware } from './security/request-logging.middleware';
 
 /**
  * Enhanced JSON logger with correlation ID support.
@@ -132,6 +133,11 @@ async function bootstrap() {
   const ddosMiddleware = new DdosProtectionMiddleware();
   app.use((req: any, res: any, next: any) => ddosMiddleware.use(req, res, next));
 
+  // #1020: Request logging middleware — logs all API requests in structured JSON format
+  // Includes: timestamp, method, path, status code, duration, user ID (when authenticated), errors
+  const requestLoggingMiddleware = new RequestLoggingMiddleware();
+  app.use((req: any, res: any, next: any) => requestLoggingMiddleware.use(req, res, next));
+
   const bodyLimit = process.env.BODY_SIZE_LIMIT ?? '10kb';
   app.use(express.json({ limit: bodyLimit }));
   app.use(express.urlencoded({ extended: true, limit: bodyLimit }));
@@ -152,7 +158,7 @@ async function bootstrap() {
   });
 
   // Fix mass assignment (API3): strip unknown fields globally.
-  // exceptionFactory passes structured errors so ValidationExceptionFilter
+  // exceptionFactory passes structured errors so ValidationErrorFilter
   // can map them to the CarbonLedger error catalog format.
   app.useGlobalPipes(
     new ValidationPipe({
@@ -171,12 +177,12 @@ async function bootstrap() {
     }),
   );
 
-  // Maps class-validator errors to CarbonLedger validation error catalog format (400 + error codes).
-  app.useGlobalFilters(new ValidationExceptionFilter());
+  // Maps class-validator errors to a field-level response while preserving HTTP 400.
+  app.useGlobalFilters(new ValidationErrorFilter());
 
   // Catch-all fallback (#966): standardizes every response NOT already handled by a
   // more specific filter above (ThrottlerExceptionFilter, StellarUnavailableExceptionFilter,
-  // ValidationExceptionFilter) into the CarbonLedger error envelope, and collapses
+  // ValidationErrorFilter) into the CarbonLedger error envelope, and collapses
   // unexpected 5xx errors to a generic message so internals never leak to callers.
   // Must be registered LAST — global filters are tried in registration order and this
   // one's bare @Catch() matches every exception, so anything registered after it would
